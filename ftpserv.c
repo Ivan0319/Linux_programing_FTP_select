@@ -8,20 +8,32 @@
 	The child process will copies the memory space of the parent process more waste of resources when we use fork()
 	Use I/O multiplexing function select(), there is no advantage over blocking IO, but that can monitor multiple IO ports at the same time
 	to handlemultiple connect.
+
+	modify 2022 Ivan
+	Use I/O multiplexing function epoll()
+	Before we use select(), the largest cost comes from checking if sockets that have had no activity have had any activity. 
+	With epoll, there is no need to check sockets that have had no activity because if they did have activity, 
+	they would have informed the epoll socket when that activity happened.
+	In a sense, select polls each socket each time you call select to see if there's any activity while epoll rigs it so that the socket activity itself notifies the process.
 	
 */
 
 #include	"ftp.h"
+#include <sys/epoll.h>
+#define MAX_EVENTS 5
 
 int
 main(int argc, char **argv)
 {
-	int					listenfd1, connfd1, ntoken,select_fd;
+	int					listenfd1, connfd1, ntoken;
 	socklen_t			clilen;
 	struct sockaddr_in	addr1, cliaddr;
 	char				buff[MAXLINE], command[MAXLINE], para[MAXLINE];
 	int	fsize,result;
-	fd_set readfds, testfds;
+	/* epoll define */
+	struct epoll_event event, events[MAX_EVENTS];
+	int epoll_fd;
+	int running = 1, event_count, i;
 
 	chdir(DEFAULT_DIR); /* default directory */
 	
@@ -38,74 +50,82 @@ main(int argc, char **argv)
 		err_quit("bind() error");
 
 	listen(listenfd1, LISTEN_Q);
+  
+  	epoll_fd = epoll_create1(0); 
+	if(epoll_fd == -1)
+	{
+		fprintf(stderr, "Failed to create epoll file descriptor\n");
+		return 1;
+	}
+	
+	event.events = EPOLLIN;
+	event.data.fd = listenfd1;
 
-	FD_ZERO(&readfds);   /* initializes an fd_set to the empty set */
-	FD_SET(listenfd1, &readfds);   /* set elements of the set corresponding to the file descriptor passed as fd */
+	if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listenfd1, &event))
+  	{
+		fprintf(stderr, "Failed to add file descriptor to epoll\n");
+		close(epoll_fd);
+		return 1;
+  	}
 	
 	for ( ; ; ) {
 
-		testfds = readfds;  /* select function could be modify readfds, copy to testfds for select function */
-		/* passed a null pointer as the timeout parameter, no timeout will occur. */
-		if((result = select(FD_SETSIZE, &testfds, (fd_set *)0,(fd_set *)0,(struct timeval *) 0)) < 1)
-		{
-			err_quit("select() error");
-			exit(1);
-		}
+		printf("\nPolling for input...\n");
+    	event_count = epoll_wait(epoll_fd, events, MAX_EVENTS, 30000);
+    	printf("%d ready events\n", event_count);
 		
-		for(select_fd = 0; select_fd < FD_SETSIZE; select_fd++)
+		for(i = 0; i < event_count; i++)
 		{
-			/* find which descriptor ,checking each in turn */
-			if(FD_ISSET(select_fd,&testfds)) 
-			{
-				if(select_fd == listenfd1) 
-				{
-					/* If the activity is on listen socket fd, it must be a request for a new connection, 
-					add the	associated client socket fd to the descriptor set */
-					clilen = sizeof(cliaddr);
-					connfd1 = accept(listenfd1, (struct sockaddr *) &cliaddr, &clilen);
-					FD_SET(connfd1, &readfds);
-				
-					printf("connection from %s, port %d, connfd1 is %d\n",
+			if (events[i].data.fd == listenfd1) {
+                clilen = sizeof(cliaddr);
+                connfd1 = accept(listenfd1, (struct sockaddr *)&cliaddr, 
+                                         &clilen);
+                printf("connection from %s, port %d, connfd1 is %d\n",
 						   inet_ntop(AF_INET, &cliaddr.sin_addr, buff, sizeof(buff)),
 						   ntohs(cliaddr.sin_port), connfd1);
-		
-					snprintf(buff, sizeof(buff), 
-					"concurrent ftp server support Multiple Clients by select function ");
-					do_OK(connfd1, buff); // +OK data_port sent to client
-				
-				}
-				else
-				{
-					/* used different select_fd to service Multiple Clients */
-					if (readline(select_fd, buff, MAXLINE) != 0) {
+               
+               
+                event.events = EPOLLIN;
+                event.data.fd = connfd1;
+                if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, connfd1, &event))
+  				{
+					fprintf(stderr, "Failed to add file descriptor to epoll\n");
+					close(epoll_fd);
+					return 1;
+  				}
+				do_OK(connfd1, buff); // +OK data_port sent to client
+            }
+            else 
+			{
+                if (readline(events[i].data.fd, buff, MAXLINE) != 0) {
 						ntoken = sscanf(buff, "%s%s%d", command, para, &fsize);
 						switch (ntoken) {
 						case 3:
 							if (strcmp(command, "STOR") == 0)
-								do_STOR(select_fd, para, fsize);
+								do_STOR(events[i].data.fd, para, fsize);
 							break;
 						case 2: 
 							if (strcmp(command, "RETR") == 0)
-								do_RETR(select_fd, para);
+								do_RETR(events[i].data.fd, para);
 							else if (strcmp(command, "LIST") == 0)
-								do_LIST(select_fd, para);
+								do_LIST(events[i].data.fd, para);
 							else
-								do_ERR(select_fd, "Unknown command parameter");
+								do_ERR(events[i].data.fd, "Unknown command parameter");
 							break;
 						default:
-							do_ERR(select_fd, "Unknown command");
+							do_ERR(events[i].data.fd, "Unknown command");
 							break;
 						}
 					}
 					else
 					{
-						/* no read any data the  client offline */
-						close(select_fd);
-						FD_CLR(select_fd,&readfds);
-						printf("removing client on fd %d",select_fd);
-					}
-				}
-			}
+						/* no read any data, the client offline */
+						epoll_ctl(epoll_fd, EPOLL_CTL_DEL, events[i].data.fd, NULL);
+						close(events[i].data.fd);
+						
+						printf("removing client on fd %d",events[i].data.fd);
+					}                   
+            }
 		}
 	}
 }
